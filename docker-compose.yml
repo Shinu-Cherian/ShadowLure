@@ -9,8 +9,9 @@ services:
       - "5000:8080"
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
-      - ConnectionStrings__DefaultConnection=Host=postgres;Database=shadowlure;Username=postgres;Password=shadowlurepass
+      - ConnectionStrings__DefaultConnection=Host=postgres;Database=shadowlure;Username=postgres;Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in a .env file, see .env.example}
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPERATOR_API_KEY=${OPERATOR_API_KEY:?Set OPERATOR_API_KEY in a .env file, see .env.example}
     depends_on:
       - postgres
 
@@ -20,7 +21,7 @@ services:
     environment:
       POSTGRES_DB: shadowlure
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: shadowlurepass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in a .env file, see .env.example}
     ports:
       - "5432:5432"
     volumes:

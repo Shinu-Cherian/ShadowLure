@@ -40,5 +40,50 @@ namespace ShadowLure.Tests
             Assert.Equal("PostgreSQL Client (psql)", _profiler.DetectToolSignature("psql/16.1", "/api/shadow/db/123"));
             Assert.Equal("Kubernetes CLI (kubectl)", _profiler.DetectToolSignature("kubectl/v1.30", "/api/shadow/k8s/123"));
         }
+
+        // CalculateRisk implements the formula documented in ARCHITECTURE.md:
+        //   Risk = (events * 10) + (maxChainDepth * 25) + (automation * 15) + (exfilAttempts * 50), capped at 100.
+        // It previously had no test coverage at all, and Program.cs used to
+        // reimplement the same formula inline instead of calling it - the two
+        // copies could silently drift apart. These tests pin the single
+        // source-of-truth behavior now that Program.cs calls this method directly.
+        [Theory]
+        [InlineData(0, 0, false, 0, 0, "Low")]
+        [InlineData(1, 1, false, 0, 35, "Medium")]
+        [InlineData(2, 1, true, 0, 60, "High")]
+        [InlineData(1, 1, false, 1, 85, "High")]
+        [InlineData(3, 2, true, 1, 145, "Critical")]
+        public void CalculateRisk_MatchesDocumentedFormula(int eventCount, int maxChainDepth, bool automation, int exfilAttempts, int expectedRawScore, string expectedLevel)
+        {
+            var session = new AttackerSession
+            {
+                MaxChainDepth = maxChainDepth,
+                AutomationDetected = automation,
+                DataExfilAttempts = exfilAttempts,
+                Events = Enumerable.Range(0, eventCount).Select(_ => new TriggerEvent()).ToList()
+            };
+
+            var (score, level) = _profiler.CalculateRisk(session);
+
+            Assert.Equal(Math.Min(expectedRawScore, 100), score);
+            Assert.Equal(expectedLevel, level);
+        }
+
+        [Fact]
+        public void CalculateRisk_NeverExceedsOneHundred()
+        {
+            var session = new AttackerSession
+            {
+                MaxChainDepth = 10,
+                AutomationDetected = true,
+                DataExfilAttempts = 5,
+                Events = Enumerable.Range(0, 20).Select(_ => new TriggerEvent()).ToList()
+            };
+
+            var (score, level) = _profiler.CalculateRisk(session);
+
+            Assert.Equal(100, score);
+            Assert.Equal("Critical", level);
+        }
     }
 }

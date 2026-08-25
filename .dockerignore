@@ -1,0 +1,12 @@
+.git
+.github
+**/bin/
+**/obj/
+*.db
+*.db-shm
+*.db-wal
+*.user
+.vs/
+.vscode/
+run-stdout.log
+run-stderr.log

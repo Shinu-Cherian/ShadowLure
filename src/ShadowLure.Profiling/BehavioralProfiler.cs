@@ -91,7 +91,12 @@ namespace ShadowLure.Profiling
                 _ => "Low"
             };
 
-            return (score, level);
+            // Documented everywhere (README, ARCHITECTURE.md, the dashboard's risk
+            // ring) as a 0-100 scale. A session with several chained triggers and an
+            // exfil attempt easily exceeds 100 (e.g. 3 events + depth 2 + automation +
+            // 1 exfil = 145), so the score must be capped for display even though the
+            // level thresholds above already saturate at "Critical" past 100.
+            return (Math.Min(score, 100), level);
         }
     }
 }

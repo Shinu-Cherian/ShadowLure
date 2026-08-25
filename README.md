@@ -178,8 +178,25 @@ curl.exe -X POST http://localhost:5246/api/shadow/{serviceType}/{your-token-guid
    dotnet run --project src/ShadowLure.Api/ShadowLure.Api.csproj --launch-profile http
    ```
 
+   In `Development` this runs with a fixed local-only operator key and prints a
+   warning; canary management (deploy/revoke/reset/simulate) still works out of
+   the box from the dashboard. In `Production`, set `OPERATOR_API_KEY` (see
+   below) or the app refuses to start.
+
 4. Access the web dashboard:
    Open `http://localhost:5246` in your browser.
+
+---
+
+## Configuration
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ConnectionStrings__DefaultConnection` | No (defaults to local SQLite) | Set to a `Host=...` PostgreSQL connection string to switch persistence backends. |
+| `GROQ_API_KEY` | No | Enables LLM-generated decoys and attacker profile summaries. Falls back to deterministic built-in templates when unset. |
+| `OPERATOR_API_KEY` | **Yes, in Production** | Authenticates operator-only actions: `POST /api/canaries`, `DELETE /api/canaries/{id}`, `POST /api/reset`, `POST /api/simulate/*`. Shadow trap endpoints (`/api/shadow/*`) stay unauthenticated by design — that's the surface attackers are meant to hit. Generate one with `openssl rand -hex 32`. The rendered dashboard injects the configured key into its own HTMX/form requests automatically, so the UI keeps working once it's set; only direct, credential-less API calls are rejected. |
+
+For `docker compose`, copy [`.env.example`](.env.example) to `.env` and fill in real values before running `docker compose up` — the compose file fails fast if `POSTGRES_PASSWORD` or `OPERATOR_API_KEY` are missing rather than falling back to a committed default.
 
 ---
 

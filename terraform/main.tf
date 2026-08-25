@@ -115,8 +115,8 @@ resource "aws_security_group" "ecs_sg" {
   vpc_id      = aws_vpc.shadowlure_vpc.id
 
   ingress {
-    from_port       = 5246
-    to_port         = 5246
+    from_port       = 8080
+    to_port         = 8080
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
   }
@@ -168,7 +168,7 @@ resource "aws_lb" "app" {
 
 resource "aws_lb_target_group" "app" {
   name        = "shadowlure-tg"
-  port        = 5246
+  port        = 8080
   protocol    = "HTTP"
   vpc_id      = aws_vpc.shadowlure_vpc.id
   target_type = "ip"
@@ -225,6 +225,29 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# The managed execution-role policy above only grants ECR pull + log group
+# access. Reading task secrets (DB connection string, Groq/operator keys)
+# via the container definition's `secrets` block requires an explicit grant.
+resource "aws_iam_role_policy" "ecs_secrets_access" {
+  name = "shadowlure-ecs-secrets-access"
+  role = aws_iam_role.ecs_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [
+          var.db_connection_string_secret_arn,
+          var.groq_api_key_secret_arn,
+          var.operator_api_key_secret_arn
+        ]
+      }
+    ]
+  })
+}
+
 # -----------------------------------------------------------------------------
 # ECS Cluster, Task Definition & Service
 # -----------------------------------------------------------------------------
@@ -248,9 +271,17 @@ resource "aws_ecs_task_definition" "app" {
       essential = true
       portMappings = [
         {
-          containerPort = 5246
-          hostPort      = 5246
+          containerPort = 8080
+          hostPort      = 8080
         }
+      ]
+      environment = [
+        { name = "ASPNETCORE_ENVIRONMENT", value = var.environment == "production" ? "Production" : "Staging" }
+      ]
+      secrets = [
+        { name = "ConnectionStrings__DefaultConnection", valueFrom = var.db_connection_string_secret_arn },
+        { name = "GROQ_API_KEY", valueFrom = var.groq_api_key_secret_arn },
+        { name = "OPERATOR_API_KEY", valueFrom = var.operator_api_key_secret_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"

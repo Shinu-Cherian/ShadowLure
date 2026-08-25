@@ -33,13 +33,48 @@ builder.Services.AddDbContext<ShadowLureDbContext>(options =>
     }
 });
 
-builder.Services.AddHttpClient();
 builder.Services.AddScoped<IShadowEngine, ShadowEngine>();
 builder.Services.AddScoped<IBehavioralProfiler, BehavioralProfiler>();
-builder.Services.AddScoped<ILlmService, GroqLlmService>();
-builder.Services.AddScoped<IAlertNotifier, AlertNotifierService>();
+
+// Typed clients so the Groq LLM call and the Slack/webhook call each get their
+// own bounded timeout. Both run off the hot path of a shadow-trap response (see
+// QueueShadowCapture below), but a background task with no timeout can still pile
+// up indefinitely against a hung upstream, so we bound it anyway.
+builder.Services.AddHttpClient<ILlmService, GroqLlmService>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+builder.Services.AddHttpClient<IAlertNotifier, AlertNotifierService>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(5);
+});
+
+// Authenticates operator-only actions (deploy/revoke canary, reset workspace,
+// run simulations). Shadow trap endpoints under /api/shadow/* are deliberately
+// left open - attackers must be able to hit them without credentials - but the
+// management API was previously wide open too, including POST /api/reset, which
+// is documented in this very README and would let an attacker who fingerprinted
+// ShadowLure wipe their own forensic trail with one unauthenticated request.
+var operatorApiKey = builder.Configuration["OPERATOR_API_KEY"];
+if (string.IsNullOrWhiteSpace(operatorApiKey))
+{
+    if (builder.Environment.IsProduction())
+    {
+        throw new InvalidOperationException(
+            "OPERATOR_API_KEY must be set in Production. It authenticates canary management " +
+            "requests (deploy/revoke/reset/simulate) so the admin API cannot be driven by an " +
+            "unauthenticated third party. Generate one with: openssl rand -hex 32");
+    }
+
+    operatorApiKey = "dev-local-operator-key";
+}
 
 var app = builder.Build();
+
+if (string.Equals(operatorApiKey, "dev-local-operator-key", StringComparison.Ordinal))
+{
+    Log.Warning("OPERATOR_API_KEY not set - using an insecure development-only default. Set it before deploying.");
+}
 
 using (var scope = app.Services.CreateScope())
 {
@@ -102,7 +137,7 @@ app.MapDelete("/api/canaries/{id:guid}", async (Guid id, ShadowLureDbContext db)
 
     var snapshot = await LoadDashboardSnapshotAsync(db);
     return Results.Content(RenderCanaryTablePartial(snapshot.Canaries), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/canaries", async (HttpContext context, ShadowLureDbContext db, ILlmService llm) =>
 {
@@ -147,7 +182,7 @@ app.MapPost("/api/canaries", async (HttpContext context, ShadowLureDbContext db,
     await db.SaveChangesAsync();
     var snapshot = await LoadDashboardSnapshotAsync(db);
     return Results.Content(RenderCanaryTablePartial(snapshot.Canaries), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/graph/data", async (ShadowLureDbContext db) =>
 {
@@ -163,7 +198,7 @@ app.MapGet("/api/graph/data", async (ShadowLureDbContext db) =>
             border = c.Status == TokenStatus.Triggered ? "#fb7185" : "#2dd4bf",
             highlight = new { background = "#13373e", border = "#5eead4" }
         },
-        font = new { color = "#ffffff", face = "Inter", size = 12, bold = true },
+        font = new { color = "#ffffff", face = "Inter", size = 12 },
         margin = 16,
         shadow = true,
         status = c.Status.ToString(),
@@ -189,9 +224,7 @@ app.MapPost("/api/shadow/aws/{tokenId:guid}", async (
     HttpContext context,
     ShadowLureDbContext db,
     IShadowEngine shadow,
-    IBehavioralProfiler profiler,
-    ILlmService llm,
-    IAlertNotifier alert) =>
+    IServiceScopeFactory scopeFactory) =>
 {
     var canary = await FindCanaryAsync(db, tokenId);
     if (canary == null)
@@ -202,18 +235,12 @@ app.MapPost("/api/shadow/aws/{tokenId:guid}", async (
     var bodyText = await ReadBodyAsync(context);
     var breadcrumb = canary.OutgoingLinks.FirstOrDefault()?.BreadcrumbLocation;
     var response = shadow.GenerateS3BucketListing(canary.Name, breadcrumb);
-    var trigger = await CaptureShadowEventAsync(
-        canary,
-        context,
-        db,
-        profiler,
-        llm,
-        alert,
-        string.IsNullOrWhiteSpace(bodyText) ? "aws s3 ls --recursive" : bodyText,
-        response,
-        "aws-cli/2.15.10 Python/3.11.6 Linux/6.5");
+    var payload = string.IsNullOrWhiteSpace(bodyText) ? "aws s3 ls --recursive" : bodyText;
+    var ip = ExtractClientIp(context);
+    var userAgent = ResolveUserAgent(context, "aws-cli/2.15.10 Python/3.11.6 Linux/6.5");
+    var path = context.Request.Path.ToString();
 
-    MetricsService.CanaryTriggersTotal.WithLabels(canary.Type.ToString(), trigger.SimulatedTool, trigger.AttackerSession?.RiskLevel ?? "Low").Inc();
+    QueueShadowCapture(scopeFactory, canary.Id, canary.Type, ip, userAgent, path, payload, response, isExfiltration: false);
     return Results.Content(response, "text/plain");
 });
 
@@ -222,9 +249,7 @@ app.MapPost("/api/shadow/db/{tokenId:guid}", async (
     HttpContext context,
     ShadowLureDbContext db,
     IShadowEngine shadow,
-    IBehavioralProfiler profiler,
-    ILlmService llm,
-    IAlertNotifier alert) =>
+    IServiceScopeFactory scopeFactory) =>
 {
     var canary = await FindCanaryAsync(db, tokenId);
     if (canary == null)
@@ -235,20 +260,12 @@ app.MapPost("/api/shadow/db/{tokenId:guid}", async (
     var bodyText = await ReadBodyAsync(context);
     var breadcrumb = canary.OutgoingLinks.FirstOrDefault()?.BreadcrumbLocation;
     var response = shadow.GenerateFakeCsvData(canary.Name, "customer_export.csv", breadcrumb);
-    var trigger = await CaptureShadowEventAsync(
-        canary,
-        context,
-        db,
-        profiler,
-        llm,
-        alert,
-        string.IsNullOrWhiteSpace(bodyText) ? "SELECT * FROM customers LIMIT 100;" : bodyText,
-        response,
-        "psql (PostgreSQL) 16.1",
-        isExfiltration: true);
+    var payload = string.IsNullOrWhiteSpace(bodyText) ? "SELECT * FROM customers LIMIT 100;" : bodyText;
+    var ip = ExtractClientIp(context);
+    var userAgent = ResolveUserAgent(context, "psql (PostgreSQL) 16.1");
+    var path = context.Request.Path.ToString();
 
-    MetricsService.DataExfiltrationAttemptsTotal.Inc();
-    MetricsService.CanaryTriggersTotal.WithLabels(canary.Type.ToString(), trigger.SimulatedTool, trigger.AttackerSession?.RiskLevel ?? "Low").Inc();
+    QueueShadowCapture(scopeFactory, canary.Id, canary.Type, ip, userAgent, path, payload, response, isExfiltration: true);
     return Results.Content(response, "text/plain");
 });
 
@@ -257,9 +274,7 @@ app.MapPost("/api/shadow/k8s/{tokenId:guid}", async (
     HttpContext context,
     ShadowLureDbContext db,
     IShadowEngine shadow,
-    IBehavioralProfiler profiler,
-    ILlmService llm,
-    IAlertNotifier alert) =>
+    IServiceScopeFactory scopeFactory) =>
 {
     var canary = await FindCanaryAsync(db, tokenId);
     if (canary == null)
@@ -268,18 +283,11 @@ app.MapPost("/api/shadow/k8s/{tokenId:guid}", async (
     }
 
     var response = shadow.GenerateDbQueryResponse("kubectl get secrets -A", canary.OutgoingLinks.FirstOrDefault()?.BreadcrumbLocation);
-    var trigger = await CaptureShadowEventAsync(
-        canary,
-        context,
-        db,
-        profiler,
-        llm,
-        alert,
-        "kubectl get secrets -A -o yaml",
-        response,
-        "kubectl/v1.30 (linux/amd64)");
+    var ip = ExtractClientIp(context);
+    var userAgent = ResolveUserAgent(context, "kubectl/v1.30 (linux/amd64)");
+    var path = context.Request.Path.ToString();
 
-    MetricsService.CanaryTriggersTotal.WithLabels(canary.Type.ToString(), trigger.SimulatedTool, trigger.AttackerSession?.RiskLevel ?? "Low").Inc();
+    QueueShadowCapture(scopeFactory, canary.Id, canary.Type, ip, userAgent, path, "kubectl get secrets -A -o yaml", response, isExfiltration: false);
     return Results.Content(response, "text/plain");
 });
 
@@ -288,9 +296,7 @@ app.MapPost("/api/shadow/api/{tokenId:guid}", async (
     HttpContext context,
     ShadowLureDbContext db,
     IShadowEngine shadow,
-    IBehavioralProfiler profiler,
-    ILlmService llm,
-    IAlertNotifier alert) =>
+    IServiceScopeFactory scopeFactory) =>
 {
     var canary = await FindCanaryAsync(db, tokenId);
     if (canary == null)
@@ -299,18 +305,11 @@ app.MapPost("/api/shadow/api/{tokenId:guid}", async (
     }
 
     var response = shadow.GenerateDbQueryResponse("GET /v1/internal/invoices", canary.OutgoingLinks.FirstOrDefault()?.BreadcrumbLocation);
-    var trigger = await CaptureShadowEventAsync(
-        canary,
-        context,
-        db,
-        profiler,
-        llm,
-        alert,
-        "GET /v1/internal/invoices?tenant=enterprise",
-        response,
-        "python-requests/2.32");
+    var ip = ExtractClientIp(context);
+    var userAgent = ResolveUserAgent(context, "python-requests/2.32");
+    var path = context.Request.Path.ToString();
 
-    MetricsService.CanaryTriggersTotal.WithLabels(canary.Type.ToString(), trigger.SimulatedTool, trigger.AttackerSession?.RiskLevel ?? "Low").Inc();
+    QueueShadowCapture(scopeFactory, canary.Id, canary.Type, ip, userAgent, path, "GET /v1/internal/invoices?tenant=enterprise", response, isExfiltration: false);
     return Results.Content(response, "text/plain");
 });
 
@@ -339,10 +338,14 @@ app.MapPost("/api/simulate/step", async (
     var eventCount = await db.TriggerEvents.CountAsync();
     var canary = canaries[eventCount % canaries.Count];
     var (payload, response, userAgent, exfil) = BuildSimulationStep(canary, shadow);
+    var ip = ExtractClientIp(context);
 
-    await CaptureShadowEventAsync(canary, context, db, profiler, llm, alert, payload, response, userAgent, exfil);
+    // userAgent here is deliberately the simulated tool's signature, not the
+    // operator's real browser UA - see ResolveUserAgent's doc comment for why
+    // that distinction matters for this specific call site.
+    await CaptureShadowEventAsync(db, profiler, llm, alert, canary.Id, ip, userAgent, context.Request.Path.ToString(), payload, response, exfil);
     return Results.Redirect("/");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/simulate/full", async (
     HttpContext context,
@@ -357,15 +360,16 @@ app.MapPost("/api/simulate/full", async (
         .OrderBy(c => c.CreatedAt)
         .ToListAsync();
 
+    var ip = ExtractClientIp(context);
     foreach (var canary in canaries.Take(4))
     {
         var (payload, response, userAgent, exfil) = BuildSimulationStep(canary, shadow);
-        await CaptureShadowEventAsync(canary, context, db, profiler, llm, alert, payload, response, userAgent, exfil);
+        await CaptureShadowEventAsync(db, profiler, llm, alert, canary.Id, ip, userAgent, context.Request.Path.ToString(), payload, response, exfil);
         await Task.Delay(60);
     }
 
     return Results.Redirect("/");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/reset", async (ShadowLureDbContext db) =>
 {
@@ -376,7 +380,7 @@ app.MapPost("/api/reset", async (ShadowLureDbContext db) =>
     await db.SaveChangesAsync();
     await SeedWorkspaceAsync(db);
     return Results.Redirect("/");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/cockpit/stats", async (ShadowLureDbContext db) =>
 {
@@ -425,7 +429,14 @@ app.MapGet("/api/events/stream", async (HttpContext context, ShadowLureDbContext
     var lastEventId = Guid.Empty;
     while (!context.RequestAborted.IsCancellationRequested)
     {
+        // AsNoTracking is required here, not just a micro-optimization: this loop
+        // reuses one request-scoped DbContext for the lifetime of the SSE
+        // connection (which can be open for hours). Without it, every polled
+        // TriggerEvent/CanaryToken gets added to the change tracker and is never
+        // released, so a long-lived dashboard tab leaks memory a little more with
+        // every 2-second poll.
         var latestEvent = await db.TriggerEvents
+            .AsNoTracking()
             .Include(e => e.CanaryToken)
             .OrderByDescending(e => e.TriggeredAt)
             .FirstOrDefaultAsync();
@@ -572,35 +583,92 @@ async Task<CanaryToken?> FindCanaryAsync(ShadowLureDbContext db, Guid tokenId)
         .FirstOrDefaultAsync(c => c.Id == tokenId);
 }
 
+string ExtractClientIp(HttpContext context)
+{
+    var ip = context.Request.Headers["X-Forwarded-For"].FirstOrDefault()
+        ?? context.Request.Headers["X-Real-IP"].FirstOrDefault()
+        ?? context.Connection.RemoteIpAddress?.ToString();
+    return string.IsNullOrWhiteSpace(ip) ? "127.0.0.1" : ip;
+}
+
+// For real shadow-trap traffic, the caller's own User-Agent (aws-cli, psql,
+// curl, ...) is what we want to record, falling back to a representative
+// default only if the request didn't send one. Simulate-endpoint callers pass
+// the simulated tool's UA directly instead of routing through this - using the
+// operator's own browser UA there would misclassify every "Trigger Step" demo
+// event as "Browser / HTTP Client" instead of the tool it's supposed to simulate.
+string ResolveUserAgent(HttpContext context, string fallbackUserAgent)
+{
+    var userAgent = context.Request.Headers.UserAgent.ToString();
+    return string.IsNullOrWhiteSpace(userAgent) ? fallbackUserAgent : userAgent;
+}
+
+// Fires the actual capture/profiling/alerting/LLM-summary pipeline in the
+// background, off its own DI scope, and returns immediately. This is used only
+// by the /api/shadow/* trap endpoints: those endpoints exist to hand a
+// believable, fast decoy response to whoever just used a leaked credential, and
+// the old implementation awaited a DB write + Slack webhook + Groq LLM call
+// before returning that response - meaning a real S3/psql/kubectl client would
+// see multi-second latency where a genuine service responds in milliseconds,
+// which is exactly the kind of tell that gives a deception platform away to a
+// careful attacker. The capture logic itself (CaptureShadowEventAsync) is
+// unchanged and still fully persisted; only the response no longer waits on it.
+void QueueShadowCapture(
+    IServiceScopeFactory scopeFactory,
+    Guid canaryId,
+    TokenType tokenType,
+    string ip,
+    string userAgent,
+    string requestPath,
+    string requestPayload,
+    string responsePayload,
+    bool isExfiltration)
+{
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var scopedDb = scope.ServiceProvider.GetRequiredService<ShadowLureDbContext>();
+            var scopedProfiler = scope.ServiceProvider.GetRequiredService<IBehavioralProfiler>();
+            var scopedLlm = scope.ServiceProvider.GetRequiredService<ILlmService>();
+            var scopedAlert = scope.ServiceProvider.GetRequiredService<IAlertNotifier>();
+
+            var trigger = await CaptureShadowEventAsync(
+                scopedDb, scopedProfiler, scopedLlm, scopedAlert,
+                canaryId, ip, userAgent, requestPath, requestPayload, responsePayload, isExfiltration);
+
+            if (isExfiltration)
+            {
+                MetricsService.DataExfiltrationAttemptsTotal.Inc();
+            }
+            MetricsService.CanaryTriggersTotal.WithLabels(tokenType.ToString(), trigger.SimulatedTool, trigger.AttackerSession?.RiskLevel ?? "Low").Inc();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Background shadow-event capture failed for canary {CanaryId}", canaryId);
+        }
+    });
+}
+
 async Task<TriggerEvent> CaptureShadowEventAsync(
-    CanaryToken canary,
-    HttpContext context,
     ShadowLureDbContext db,
     IBehavioralProfiler profiler,
     ILlmService llm,
     IAlertNotifier alert,
+    Guid canaryId,
+    string ip,
+    string userAgent,
+    string requestPath,
     string requestPayload,
     string responsePayload,
-    string fallbackUserAgent,
     bool isExfiltration = false)
 {
+    var canary = await db.CanaryTokens.FirstOrDefaultAsync(c => c.Id == canaryId)
+        ?? throw new InvalidOperationException($"Canary {canaryId} was deleted before its trigger event could be captured.");
+
     canary.TriggerCount++;
     canary.Status = TokenStatus.Triggered;
-
-    var ip = context.Request.Headers["X-Forwarded-For"].FirstOrDefault()
-        ?? context.Request.Headers["X-Real-IP"].FirstOrDefault()
-        ?? context.Connection.RemoteIpAddress?.ToString();
-
-    if (string.IsNullOrWhiteSpace(ip))
-    {
-        ip = "127.0.0.1";
-    }
-
-    var userAgent = context.Request.Headers.UserAgent.ToString();
-    if (string.IsNullOrWhiteSpace(userAgent))
-    {
-        userAgent = fallbackUserAgent;
-    }
 
     var fingerprint = profiler.GenerateFingerprint(ip, userAgent);
     var session = await db.AttackerSessions
@@ -628,7 +696,6 @@ async Task<TriggerEvent> CaptureShadowEventAsync(
         session.DataExfilAttempts++;
     }
 
-    var eventCountAfterCapture = session.Events.Count + 1;
     var triggerEvent = new TriggerEvent
     {
         CanaryTokenId = canary.Id,
@@ -636,30 +703,22 @@ async Task<TriggerEvent> CaptureShadowEventAsync(
         AttackerIp = ip,
         UserAgent = userAgent,
         RequestMethod = "POST",
-        RequestPath = context.Request.Path,
+        RequestPath = requestPath,
         RequestPayload = requestPayload,
         ResponsePayload = responsePayload,
-        ChainDepth = eventCountAfterCapture,
-        SimulatedTool = profiler.DetectToolSignature(userAgent, context.Request.Path),
+        SimulatedTool = profiler.DetectToolSignature(userAgent, requestPath),
         IsAutomationScript = session.AutomationDetected
     };
 
     db.TriggerEvents.Add(triggerEvent);
+    session.Events.Add(triggerEvent);
+    triggerEvent.ChainDepth = session.Events.Count;
     session.MaxChainDepth = Math.Max(session.MaxChainDepth, triggerEvent.ChainDepth);
 
-    var score = (eventCountAfterCapture * 10)
-        + (session.MaxChainDepth * 25)
-        + (session.AutomationDetected ? 15 : 0)
-        + (session.DataExfilAttempts * 50);
-    var level = score switch
-    {
-        >= 100 => "Critical",
-        >= 60 => "High",
-        >= 30 => "Medium",
-        _ => "Low"
-    };
-
-    session.RiskScore = Math.Min(score, 100);
+    // Single source of truth for the risk formula - this used to be reimplemented
+    // inline here, duplicating (and risking drifting from) BehavioralProfiler.CalculateRisk.
+    var (score, level) = profiler.CalculateRisk(session);
+    session.RiskScore = score;
     session.RiskLevel = level;
 
     await db.SaveChangesAsync();
@@ -674,14 +733,46 @@ async Task<TriggerEvent> CaptureShadowEventAsync(
     session.LlmProfileSummary = await llm.GenerateAttackerProfileAsync(summary);
     await db.SaveChangesAsync();
 
-    triggerEvent.AttackerSession = session;
     return triggerEvent;
 }
 
 async Task<string> ReadBodyAsync(HttpContext context)
 {
+    // Shadow endpoints are the one part of the app deliberately exposed to
+    // untrusted/attacker traffic. Without a cap, ReadToEndAsync() on the raw
+    // body stream lets anyone who finds a token GUID (or brute-forces one) send
+    // an effectively unbounded POST body and exhaust server memory. 64 KB is
+    // far more than any realistic aws-cli/psql/kubectl request body.
+    const int maxBodyBytes = 64 * 1024;
     using var reader = new StreamReader(context.Request.Body);
-    return await reader.ReadToEndAsync();
+    var buffer = new char[maxBodyBytes];
+    var read = await reader.ReadBlockAsync(buffer, 0, buffer.Length);
+    return new string(buffer, 0, read);
+}
+
+// Endpoint filter applied to every operator-only mutating route (deploy/revoke
+// canary, reset workspace, run simulations). Accepts the key either as the
+// X-Operator-Key header (what the dashboard's own HTMX requests send, via the
+// hx-headers attribute on <body>) or as a "key" form field (what the three
+// plain <form method="post"> actions send, since htmx headers don't apply to
+// native browser form submissions).
+async ValueTask<object?> RequireOperatorKeyAsync(EndpointFilterInvocationContext efic, EndpointFilterDelegate next)
+{
+    var request = efic.HttpContext.Request;
+    var provided = request.Headers["X-Operator-Key"].FirstOrDefault();
+
+    if (string.IsNullOrEmpty(provided) && request.HasFormContentType)
+    {
+        var form = await request.ReadFormAsync();
+        provided = form["key"].FirstOrDefault();
+    }
+
+    if (!string.Equals(provided, operatorApiKey, StringComparison.Ordinal))
+    {
+        return Results.Unauthorized();
+    }
+
+    return await next(efic);
 }
 
 (string Payload, string Response, string UserAgent, bool Exfiltration) BuildSimulationStep(CanaryToken canary, IShadowEngine shadow)
@@ -931,7 +1022,7 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
             }
         </style>
     </head>
-    <body>
+    <body hx-headers='{"X-Operator-Key": "{{EncodeForSingleQuotedJsonAttribute(operatorApiKey)}}"}'>
         <!-- NAV -->
         <nav class="nav">
             <div class="shell flex items-center justify-between py-3.5">
@@ -976,6 +1067,7 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
                                 Launch Cockpit
                             </a>
                             <form action="/api/simulate/full" method="post">
+                                <input type="hidden" name="key" value="{{E(operatorApiKey)}}">
                                 <button class="btn-hero btn-hero-secondary" type="submit">
                                     <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/></svg>
                                     Run Full Attack Simulation
@@ -1116,9 +1208,11 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
                         </div>
                         <div class="flex items-center gap-3 reveal">
                             <form action="/api/simulate/step" method="post">
+                                <input type="hidden" name="key" value="{{E(operatorApiKey)}}">
                                 <button class="btn btn-ghost" type="submit">Trigger Step</button>
                             </form>
                             <form action="/api/reset" method="post">
+                                <input type="hidden" name="key" value="{{E(operatorApiKey)}}">
                                 <button class="btn btn-ghost" type="submit">Reset</button>
                             </form>
                             <button hx-get="/api/canaries/modal" hx-target="#modal-container" hx-swap="innerHTML" class="btn btn-primary">Deploy Canary</button>
@@ -1314,7 +1408,12 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
                                 shape: 'ellipse',
                                 borderWidth: 2,
                                 margin: { top: 14, bottom: 14, left: 20, right: 20 },
-                                font: { color: '#ffffff', face: 'Inter', size: 12, bold: true },
+                                // vis-network's font.bold/ital/mono sub-config only applies when
+                                // `multi` markdown parsing is enabled on the label text (it isn't
+                                // here); passing bold:true against a plain font config is invalid
+                                // per vis-network's own options validator and does nothing visually,
+                                // so it's simply omitted rather than "fixed" to a no-op value.
+                                font: { color: '#ffffff', face: 'Inter', size: 12 },
                                 shadow: { enabled: true, color: 'rgba(0,0,0,0.6)', size: 10 }
                             },
                             edges: {
@@ -1394,54 +1493,6 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
 }
 
 
-string RenderHeroTranscript(List<TriggerEvent> events)
-{
-    if (events.Count == 0)
-    {
-        return """
-        <div class="terminal-line">
-            <span class="mono text-xs text-slate-500">00:00:00</span>
-            <span class="text-sm text-slate-300">prod-s3-replication-key seeded inside fake Terraform output</span>
-            <span class="mono text-xs text-teal-200">armed</span>
-        </div>
-        <div class="terminal-line">
-            <span class="mono text-xs text-slate-500">00:00:04</span>
-            <span class="text-sm text-slate-300">shadow S3 route ready to return believable bucket inventory</span>
-            <span class="mono text-xs text-amber-200">waiting</span>
-        </div>
-        <div class="terminal-line">
-            <span class="mono text-xs text-slate-500">00:00:08</span>
-            <span class="text-sm text-slate-300">risk model will escalate when a credential becomes an attack path</span>
-            <span class="mono text-xs text-slate-300">quiet</span>
-        </div>
-        """;
-    }
-
-    var lines = new StringBuilder();
-    foreach (var e in events.Take(6))
-    {
-        lines.Append($"""
-        <div class="terminal-line">
-            <span class="mono text-xs text-slate-500">{E(e.TriggeredAt.ToString("HH:mm:ss"))}</span>
-            <span class="text-sm text-slate-200">{E(e.SimulatedTool)} touched {E(e.CanaryToken?.Name ?? "shadow decoy")}</span>
-            <span class="mono text-xs text-rose-200">depth {e.ChainDepth}</span>
-        </div>
-        """);
-    }
-    return lines.ToString();
-}
-
-string RenderStoryStep(string number, string title, string body)
-{
-    return $"""
-    <div class="panel p-5">
-        <div class="mono text-xs font-black text-teal-200">{E(number)}</div>
-        <h3 class="mt-4 text-xl font-black">{E(title)}</h3>
-        <p class="mt-3 text-sm leading-6 text-slate-300">{E(body)}</p>
-    </div>
-    """;
-}
-
 string RenderMetric(string label, string value, string note, string icon = "shield", string valueId = "")
 {
     var svg = icon switch {
@@ -1475,16 +1526,6 @@ string RenderProfileRow(string label, string value, string valueId = "")
     <div class="flex items-center justify-between py-2 border-b border-white/5">
         <span class="text-xs text-slate-400">{E(label)}</span>
         <span {idAttr}class="text-sm font-medium text-slate-200 mono">{E(value)}</span>
-    </div>
-    """;
-}
-
-string RenderArchitectureItem(string title, string body)
-{
-    return $"""
-    <div class="panel p-5">
-        <h3 class="text-lg font-black">{E(title)}</h3>
-        <p class="mt-3 text-sm leading-6 text-slate-300">{E(body)}</p>
     </div>
     """;
 }
@@ -1874,6 +1915,16 @@ string DefaultPayloadFor(TokenType tokenType)
 string E(string? value)
 {
     return WebUtility.HtmlEncode(value ?? string.Empty);
+}
+
+// Embeds a value inside the JSON object literal of a single-quoted HTML
+// attribute (htmx's hx-headers='{"...": "..."}' pattern). Escapes backslashes
+// and double-quotes so the result stays valid JSON, then HTML-escapes any
+// apostrophe so it can't break out of the attribute's single-quote delimiter.
+string EncodeForSingleQuotedJsonAttribute(string value)
+{
+    var jsonEscaped = value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    return jsonEscaped.Replace("'", "&#39;");
 }
 
 record DashboardSnapshot(
