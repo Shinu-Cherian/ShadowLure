@@ -25,5 +25,8 @@ jobs:
       - name: Build Solution
         run: dotnet build ShadowLure.sln --no-restore --configuration Release
 
+      - name: Run xUnit Unit Tests
+        run: dotnet test ShadowLure.sln --no-build --configuration Release
+
       - name: Run Docker Build Verification
         run: docker build -t shadowlure-api:ci .
