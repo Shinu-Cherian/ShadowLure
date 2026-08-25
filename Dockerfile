@@ -9,6 +9,7 @@ COPY src/ShadowLure.Shadow/*.csproj ./src/ShadowLure.Shadow/
 COPY src/ShadowLure.Profiling/*.csproj ./src/ShadowLure.Profiling/
 COPY src/ShadowLure.Infrastructure/*.csproj ./src/ShadowLure.Infrastructure/
 COPY src/ShadowLure.Api/*.csproj ./src/ShadowLure.Api/
+COPY tests/ShadowLure.Tests/*.csproj ./tests/ShadowLure.Tests/
 
 RUN dotnet restore
 
