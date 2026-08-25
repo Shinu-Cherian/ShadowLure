@@ -1,0 +1,29 @@
+name: ShadowLure CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK 9.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore Dependencies
+        run: dotnet restore ShadowLure.sln
+
+      - name: Build Solution
+        run: dotnet build ShadowLure.sln --no-restore --configuration Release
+
+      - name: Run Docker Build Verification
+        run: docker build -t shadowlure-api:ci .
