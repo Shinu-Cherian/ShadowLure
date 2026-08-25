@@ -2,7 +2,7 @@
 
 Active Deception Architecture and Honeytoken Orchestration Engine
 
-ShadowLure is an enterprise-grade active cyber defense platform designed to detect, track, and profile unauthorized network intruders. Unlike conventional passive honeypots or static canaries that issue a single binary alert, ShadowLure deploys dynamic, contextual deception chains across cloud infrastructure, database environments, Kubernetes clusters, and API gateways. When an adversary interacts with a seeded lure, ShadowLure traps the threat actor inside an instrumented decoy path, serving high-fidelity simulated responses while capturing real-time forensic telemetry, tool fingerprints, and behavioral metrics.
+ShadowLure is an enterprise-grade active cyber defense platform designed to detect, track, and profile unauthorized network intruders. Unlike conventional passive honeypots or static canary tokens that issue a single binary alert, ShadowLure deploys dynamic, contextual deception chains across cloud infrastructure, database environments, Kubernetes clusters, and API gateways. When an adversary interacts with a seeded lure, ShadowLure traps the threat actor inside an instrumented decoy path, serving high-fidelity simulated responses while capturing real-time forensic telemetry, tool fingerprints, and behavioral metrics.
 
 ---
 
@@ -13,13 +13,14 @@ Modern security architectures often struggle with high false-positive noise and 
 Key Operational Properties:
 
 - Zero False Positives: Decoy assets are non-operational traps. Any traffic directed toward a ShadowLure asset indicates high-confidence unauthorized activity.
+- Dynamic Token Provisioning: Operators can provision custom canary tokens for any tech stack (AWS S3, PostgreSQL, Kubernetes, Internal APIs) on demand, receiving dynamic UUIDs and tailored decoy payloads.
 - Multihop Breadcrumb Traps: Decoys do not terminate at a single point. Accessing an initial AWS S3 decoy reveals secondary breadcrumbs leading to PostgreSQL databases, Kubernetes secrets, and internal API tokens.
 - Realistic Synthetic Telemetry: Instead of dropping TCP connections or returning generic HTTP errors, ShadowLure returns believable synthetic S3 bucket listings, database query result sets, and Kubernetes YAML manifests to prolong adversary engagement.
 - Automated Attacker Profiling: Fingerprints incoming HTTP user agents, request cadence, automation script signatures, and network connection metadata to construct a comprehensive threat dossier.
 
 ---
 
-## Architecture and Component Breakdown
+## System Architecture and Layer Breakdown
 
 ShadowLure is architected as a modular, decoupled C# .NET 9 solution separated into clean layer boundaries:
 
@@ -49,8 +50,8 @@ ShadowLure is architected as a modular, decoupled C# .NET 9 solution separated i
 
 ### Component Modules
 
-1. ShadowLure.Core: Contains domain entities, enums, values objects, database schema definitions (`CanaryToken`, `AttackerSession`, `TriggerEvent`, `CanaryLink`), and interface abstractions.
-2. ShadowLure.Shadow: Implements the active deception engine (`IShadowEngine`), generating synthetic S3 directory structures, SQL query datasets, and Kubernetes secrets.
+1. ShadowLure.Core: Contains domain entities, enums, value objects, database schema definitions (`CanaryToken`, `AttackerSession`, `TriggerEvent`, `CanaryLink`), and interface abstractions.
+2. ShadowLure.Shadow: Implements the active deception engine (`IShadowEngine`), generating dynamic synthetic S3 directory structures, SQL query datasets, and Kubernetes secrets for any registered token ID.
 3. ShadowLure.Profiling: Houses the behavioral analytics pipeline (`IBehavioralProfiler`), generating SHA-256 client fingerprints, detecting CLI automation patterns, calculating chain depths, and scoring threat risk levels.
 4. ShadowLure.Infrastructure: Handles data persistence via Entity Framework Core, Prometheus metric instrumentation (`MetricsService`), LLM threat summary synthesis, and external webhook notification integrations.
 5. ShadowLure.Api: Serves as the Minimal API entry point, HTMX server-side rendering host, Server-Sent Events (SSE) stream server, and interactive operator dashboard host.
@@ -59,22 +60,25 @@ ShadowLure is architected as a modular, decoupled C# .NET 9 solution separated i
 
 ## Core Capabilities
 
-### 1. Active Deception Chaining
-Deception assets are interconnected via directional links. When an attacker accesses `prod-s3-replication-key`, the synthetic response contains breadcrumbs pointing to `customer-ledger-readonly`. Accessing the database returns credentials pointing to `eks-payments-secret`, creating a multi-stage decoy chain that tracks attacker progression.
+### 1. Dynamic Decoy Provisioning Engine
+Operators are not restricted to pre-configured templates. Through the interactive dashboard or API, operators specify any target environment (e.g., `Enterprise AWS Production`, `Staging Database Cluster`). The engine generates a unique `Guid`, crafts matching decoy credentials, and registers dynamic shadow routing handlers automatically.
 
-### 2. Live Operator Cockpit and Circular Topology Graph
-The web dashboard features an interactive circular network graph powered by Vis.js Network with custom physics constraints (`barnesHut`). Activated nodes transition in real time from cyan (active) to rose/red (intercepted), while curved edge labels display exact breadcrumb locations with padded badge rendering for visual clarity.
+### 2. Active Deception Chaining
+Deception assets are interconnected via directional links. Accessing an AWS S3 decoy returns synthetic responses embedded with breadcrumbs pointing to database tokens. Following the database breadcrumbs reveals Kubernetes secrets and API keys, creating a multi-stage decoy chain that tracks attacker progression step by step.
 
-### 3. Server-Sent Events (SSE) Telemetry Stream
-Real-time events bypass traditional polling via a high-throughput SSE endpoint (`/api/events/stream`). Incoming attacker interactions automatically trigger lightweight DOM updates, recalculating Risk Scores, updating Threat Level indicators, and re-rendering Attacker Profile cards without requiring manual page refreshes.
+### 3. Live Operator Cockpit and Circular Topology Graph
+The web dashboard features an interactive circular network graph powered by Vis.js Network with custom physics constraints (`barnesHut`). Activated nodes transition in real time from cyan (active) to rose/red (intercepted), while curved edge labels display exact breadcrumb locations with stroke-padded background rendering for clear legibility.
 
-### 4. Forensic Attacker Intelligence Dossier
+### 4. Server-Sent Events (SSE) Telemetry Stream
+Real-time events bypass traditional polling via a high-throughput SSE endpoint (`/api/events/stream`). Incoming attacker interactions automatically trigger lightweight DOM updates, recalculating Risk Scores, updating Threat Level indicators, and re-rendering Attacker Profile cards without requiring page refreshes.
+
+### 5. Forensic Attacker Intelligence Dossier
 Operators can launch the Forensic Attacker Dossier modal to inspect full session analytics:
-- Real Connection IP & Network Metadata
+- Real Connection IP & Network Connection Metadata
 - User-Agent Client Fingerprint & CLI Security Tool Classifier
 - Automation Detection Status (Interactive Shell vs. Automated Recon Script)
 - Risk Score Calculation (0-100 scale: Low, Medium, High, Critical)
-- Dynamic Threat Intelligence Summary
+- Dynamic Threat Intelligence Behavioral Summary
 - Execution Chronology Trace Table containing full un-truncated HTTP request payloads and deception response payloads.
 
 ---
@@ -85,7 +89,7 @@ Operators can launch the Forensic Attacker Dossier modal to inspect full session
 - Object-Relational Mapper: Entity Framework Core 9.0
 - Data Persistence: SQLite / EF Core Relational Engine
 - Frontend Logic & Interactivity: HTMX 2.0 (Server-Side HTML Fragments & SSE Swap)
-- Styling & Design System: Modern Vanilla CSS & Tailwind CSS Engine
+- Styling & Design System: Vanilla CSS & Tailwind CSS Engine
 - Graph Visualization: Vis.js Network Engine (Radial Elliptical Layouts & Barnes-Hut Physics)
 - Smooth Scrolling & Reveal Animations: Lenis 1.1 Smooth Scroll & GSAP 3.12 ScrollTrigger
 - Observability & Metrics: Prometheus Client Library (`prometheus-net`)
@@ -95,26 +99,28 @@ Operators can launch the Forensic Attacker Dossier modal to inspect full session
 
 ## API Reference Specification
 
-### Deception Endpoints (Attacker Targets)
+### Dynamic Shadow Endpoints (Attacker Trap Targets)
+
+Shadow routes handle incoming requests dynamically for any provisioned canary token `Guid`:
 
 | HTTP Method | Route | Description |
 |---|---|---|
-| POST | `/api/shadow/aws/{tokenId}` | Handles AWS S3 decoy requests, returning synthetic S3 listings. |
-| POST | `/api/shadow/db/{tokenId}` | Handles database connection lures, returning synthetic SQL query results. |
-| POST | `/api/shadow/k8s/{tokenId}` | Handles Kubernetes decoy access, returning synthetic secret YAMLs. |
-| POST | `/api/shadow/api/{tokenId}` | Handles internal API decoy requests, returning fake invoice JSONs. |
+| POST | `/api/shadow/aws/{tokenId:guid}` | Traps AWS CLI/S3 requests for token `tokenId`, returning synthetic S3 file listings. |
+| POST | `/api/shadow/db/{tokenId:guid}` | Traps SQL database requests for token `tokenId`, returning synthetic CSV/SQL data. |
+| POST | `/api/shadow/k8s/{tokenId:guid}` | Traps Kubernetes cluster secret requests for token `tokenId`, returning fake secret YAMLs. |
+| POST | `/api/shadow/api/{tokenId:guid}` | Traps API token invocations for token `tokenId`, returning fake internal JSON data. |
 
 ### Operator Dashboard Endpoints
 
 | HTTP Method | Route | Description |
 |---|---|---|
-| GET | `/` | Renders the Widescreen Dashboard Operator Cockpit. |
+| GET | `/` | Renders the Widescreen Operator Cockpit. |
 | GET | `/api/events/stream` | Opens an SSE connection streaming live telemetry event cards. |
 | GET | `/api/cockpit/stats` | Returns real-time JSON metrics, risk scores, and profile state. |
 | GET | `/api/graph/data` | Returns Vis.js network nodes and edge links JSON structure. |
-| GET | `/api/canaries/modal` | Renders the HTML modal for deploying new contextual canary tokens. |
-| POST | `/api/canaries` | Creates a new canary decoy token and appends it to the registry. |
-| GET | `/api/canaries/{id}/details` | Renders the inspection modal containing PowerShell test commands. |
+| GET | `/api/canaries/modal` | Renders the HTML modal for deploying custom contextual canary tokens. |
+| POST | `/api/canaries` | Creates a new custom decoy token dynamically and registers its shadow routes. |
+| GET | `/api/canaries/{id}/details` | Renders the inspection modal containing exact PowerShell test commands for token `{id}`. |
 | DELETE | `/api/canaries/{id}` | Revokes and deletes a specific canary token from the database. |
 | GET | `/api/attacker/details` | Renders the Forensic Attacker Dossier Modal with full HTTP logs. |
 | POST | `/api/simulate/step` | Advances the simulation scenario by one decoy interception step. |
@@ -123,29 +129,26 @@ Operators can launch the Forensic Attacker Dossier modal to inspect full session
 
 ---
 
-## Verification and Testing Guide
+## Dynamic Decoy Testing Guide
 
-Follow these step-by-step commands to verify deception triggers in Microsoft Windows PowerShell:
+To test any deployed decoy token (seeded or custom-created):
 
-### 1. AWS S3 Decoy Interception
+### 1. Provision or Select a Canary Token
+Click **Deploy Canary** on the dashboard to create a custom token, or select any existing token from the **Canary Registry** table.
+
+### 2. Inspect Dynamic Command
+Click **Inspect** on the target token's row in the table. The inspection modal automatically generates the tailored PowerShell command with that token's unique `Guid`.
+
+### 3. General Command Pattern
 ```powershell
-curl.exe -X POST http://localhost:5246/api/shadow/aws/c2d77a06-444f-4eb8-b9a3-577823fcae6d -H "User-Agent: aws-cli/2.15.10" -d "aws s3 ls --recursive s3://prod-s3-replication"
+curl.exe -X POST http://localhost:5246/api/shadow/{serviceType}/{your-token-guid} -H "User-Agent: {tool-signature}" -d "{payload}"
 ```
 
-### 2. PostgreSQL Database Decoy Interception
-```powershell
-curl.exe -X POST http://localhost:5246/api/shadow/db/e5f1b2c3-8899-4d5e-a1b2-3c4d5e6f7a8b -H "User-Agent: psql/16.1" -d "SELECT * FROM customer_ledgers LIMIT 5"
-```
-
-### 3. Kubernetes Secret Decoy Interception
-```powershell
-curl.exe -X POST http://localhost:5246/api/shadow/k8s/f6a7b8c9-0011-4223-b334-5d6e7f8a9b0c -H "User-Agent: kubectl/v1.30 (linux/amd64)" -d "kubectl get secrets -A -o yaml"
-```
-
-### 4. Internal API Decoy Interception
-```powershell
-curl.exe -X POST http://localhost:5246/api/shadow/api/a1b2c3d4-e5f6-4789-8012-3456789abcde -H "User-Agent: python-requests/2.32" -d "GET /v1/internal/invoices?tenant=enterprise"
-```
+### 4. Service Type Map
+- AWS S3 Decoy: Service type path = `aws`
+- PostgreSQL Database Decoy: Service type path = `db`
+- Kubernetes Secret Decoy: Service type path = `k8s`
+- Internal API Decoy: Service type path = `api`
 
 ---
 
