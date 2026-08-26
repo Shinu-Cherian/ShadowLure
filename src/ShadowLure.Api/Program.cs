@@ -74,6 +74,11 @@ var app = builder.Build();
 if (string.Equals(operatorApiKey, "dev-local-operator-key", StringComparison.Ordinal))
 {
     Log.Warning("OPERATOR_API_KEY not set - using an insecure development-only default. Set it before deploying.");
+    // The dashboard and every other read endpoint now require this key too (not
+    // just mutations), so a bare http://localhost:5246 will 401. Since a fresh
+    // clone has no other way to discover the key, print the exact URL to open.
+    var httpUrl = app.Urls.FirstOrDefault() ?? "http://localhost:5246";
+    Log.Information("Dashboard: {Url}", $"{httpUrl}/?key={operatorApiKey}");
 }
 
 using (var scope = app.Services.CreateScope())
@@ -84,24 +89,24 @@ using (var scope = app.Services.CreateScope())
 }
 
 app.UseHttpMetrics();
-app.MapMetrics("/metrics");
+app.MapMetrics("/metrics").AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/", async (ShadowLureDbContext db) =>
 {
     var snapshot = await LoadDashboardSnapshotAsync(db);
     return Results.Content(RenderFullDashboardHtml(snapshot), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/canaries/table", async (ShadowLureDbContext db) =>
 {
     var snapshot = await LoadDashboardSnapshotAsync(db);
     return Results.Content(RenderCanaryTablePartial(snapshot.Canaries), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/canaries/modal", () =>
 {
     return Results.Content(RenderCreateCanaryModalPartial(), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/canaries/{id:guid}/details", async (Guid id, ShadowLureDbContext db) =>
 {
@@ -116,7 +121,7 @@ app.MapGet("/api/canaries/{id:guid}/details", async (Guid id, ShadowLureDbContex
     }
 
     return Results.Content(RenderCanaryDetailsModalPartial(canary), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapDelete("/api/canaries/{id:guid}", async (Guid id, ShadowLureDbContext db) =>
 {
@@ -217,7 +222,7 @@ app.MapGet("/api/graph/data", async (ShadowLureDbContext db) =>
     });
 
     return Results.Json(new { nodes, edges });
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/shadow/aws/{tokenId:guid}", async (
     Guid tokenId,
@@ -344,7 +349,7 @@ app.MapPost("/api/simulate/step", async (
     // operator's real browser UA - see ResolveUserAgent's doc comment for why
     // that distinction matters for this specific call site.
     await CaptureShadowEventAsync(db, profiler, llm, alert, canary.Id, ip, userAgent, context.Request.Path.ToString(), payload, response, exfil);
-    return Results.Redirect("/");
+    return Results.Redirect($"/?key={Uri.EscapeDataString(operatorApiKey)}");
 }).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/simulate/full", async (
@@ -368,7 +373,7 @@ app.MapPost("/api/simulate/full", async (
         await Task.Delay(60);
     }
 
-    return Results.Redirect("/");
+    return Results.Redirect($"/?key={Uri.EscapeDataString(operatorApiKey)}");
 }).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapPost("/api/reset", async (ShadowLureDbContext db) =>
@@ -379,7 +384,7 @@ app.MapPost("/api/reset", async (ShadowLureDbContext db) =>
     db.CanaryTokens.RemoveRange(db.CanaryTokens);
     await db.SaveChangesAsync();
     await SeedWorkspaceAsync(db);
-    return Results.Redirect("/");
+    return Results.Redirect($"/?key={Uri.EscapeDataString(operatorApiKey)}");
 }).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/cockpit/stats", async (ShadowLureDbContext db) =>
@@ -408,7 +413,7 @@ app.MapGet("/api/cockpit/stats", async (ShadowLureDbContext db) =>
         summary,
         tableHtml = RenderCanaryTablePartial(canaries)
     });
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/attacker/details", async (ShadowLureDbContext db) =>
 {
@@ -418,7 +423,7 @@ app.MapGet("/api/attacker/details", async (ShadowLureDbContext db) =>
         .FirstOrDefaultAsync();
 
     return Results.Content(RenderAttackerDossierModalPartial(session), "text/html");
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.MapGet("/api/events/stream", async (HttpContext context, ShadowLureDbContext db) =>
 {
@@ -451,7 +456,7 @@ app.MapGet("/api/events/stream", async (HttpContext context, ShadowLureDbContext
 
         await Task.Delay(2000, context.RequestAborted);
     }
-});
+}).AddEndpointFilter(RequireOperatorKeyAsync);
 
 app.Run();
 
@@ -750,12 +755,23 @@ async Task<string> ReadBodyAsync(HttpContext context)
     return new string(buffer, 0, read);
 }
 
-// Endpoint filter applied to every operator-only mutating route (deploy/revoke
-// canary, reset workspace, run simulations). Accepts the key either as the
-// X-Operator-Key header (what the dashboard's own HTMX requests send, via the
-// hx-headers attribute on <body>) or as a "key" form field (what the three
-// plain <form method="post"> actions send, since htmx headers don't apply to
-// native browser form submissions).
+// Endpoint filter applied to every operator-only route - both the mutating
+// ones (deploy/revoke canary, reset workspace, run simulations) and, since the
+// dashboard exposes real captured attacker IPs/payloads and decoy credential
+// values, every read route too (dashboard page, canary details, forensic
+// dossier, graph/stats JSON, SSE stream, /metrics). Only /api/shadow/* stays
+// open - attackers must be able to reach those without credentials.
+//
+// The key can arrive three ways, checked in this order:
+//   1. X-Operator-Key header - what the dashboard's own HTMX requests send,
+//      via the hx-headers attribute on <body>.
+//   2. A "key" form field - what the three plain <form method="post"> actions
+//      send, since htmx headers don't apply to native browser form submissions.
+//   3. A "key" query string parameter - required for GET /, because a plain
+//      browser navigation can't attach a custom header, and for the SSE
+//      stream, because the native EventSource API can't attach one either.
+//      The dashboard's own links/fetch calls/SSE connection all carry it this
+//      way once the page itself has loaded with a valid key.
 async ValueTask<object?> RequireOperatorKeyAsync(EndpointFilterInvocationContext efic, EndpointFilterDelegate next)
 {
     var request = efic.HttpContext.Request;
@@ -767,9 +783,17 @@ async ValueTask<object?> RequireOperatorKeyAsync(EndpointFilterInvocationContext
         provided = form["key"].FirstOrDefault();
     }
 
+    if (string.IsNullOrEmpty(provided))
+    {
+        provided = request.Query["key"].FirstOrDefault();
+    }
+
     if (!string.Equals(provided, operatorApiKey, StringComparison.Ordinal))
     {
-        return Results.Unauthorized();
+        return Results.Text(
+            "Unauthorized. Provide the operator key via an X-Operator-Key header or a ?key= query parameter.",
+            "text/plain",
+            statusCode: StatusCodes.Status401Unauthorized);
     }
 
     return await next(efic);
@@ -1027,14 +1051,14 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
         <nav class="nav">
             <div class="shell flex items-center justify-between py-3.5">
                 <div class="flex items-center gap-6">
-                    <a href="/" class="text-lg font-bold tracking-tight text-white hover:text-teal-300 transition-colors">
+                    <a href="/?key={{E(Uri.EscapeDataString(operatorApiKey))}}" class="text-lg font-bold tracking-tight text-white hover:text-teal-300 transition-colors">
                         ShadowLure
                     </a>
                     <div class="hidden md:flex items-center gap-5">
                         <a href="#features" class="text-sm text-zinc-500 hover:text-zinc-200 transition-colors">Features</a>
                         <a href="#cockpit" class="text-sm text-zinc-500 hover:text-zinc-200 transition-colors">Cockpit</a>
                         <a href="#architecture" class="text-sm text-zinc-500 hover:text-zinc-200 transition-colors">Architecture</a>
-                        <a href="/metrics" target="_blank" class="text-sm text-zinc-500 hover:text-amber-300 mono transition-colors">/metrics</a>
+                        <a href="/metrics?key={{E(Uri.EscapeDataString(operatorApiKey))}}" target="_blank" class="text-sm text-zinc-500 hover:text-amber-300 mono transition-colors">/metrics</a>
                     </div>
                 </div>
                 <div class="flex items-center gap-2.5">
@@ -1283,7 +1307,7 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
                                     <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-rose-500"></span>
                                 </span>
                             </div>
-                            <div hx-ext="sse" sse-connect="/api/events/stream" sse-swap="message" hx-swap="afterbegin" id="live-events-container" class="flex-1 overflow-y-auto space-y-3 pr-2">
+                            <div hx-ext="sse" sse-connect="/api/events/stream?key={{E(Uri.EscapeDataString(operatorApiKey))}}" sse-swap="message" hx-swap="afterbegin" id="live-events-container" class="flex-1 overflow-y-auto space-y-3 pr-2">
                                 {{RenderLiveEventsFeedPartial(events)}}
                             </div>
                         </div>
@@ -1340,6 +1364,13 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
         <div id="modal-container"></div>
 
         <script>
+            // Every read endpoint requires the operator key too (see RequireOperatorKeyAsync
+            // in Program.cs). This page only rendered because the request that loaded it
+            // already carried a valid key, so it's safe to reuse here for this page's own
+            // background fetch/SSE calls - EventSource can't set custom headers, so the SSE
+            // connection carries it as a query param instead of a header.
+            const OPERATOR_KEY = "{{EncodeForJsStringLiteral(operatorApiKey)}}";
+
             /* Lenis Smooth Scroll */
             const lenis = new Lenis({
                 duration: 1.2,
@@ -1384,7 +1415,7 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
             /* Vis.js Graph */
             let network = null;
             function reloadGraph() {
-                fetch('/api/graph/data')
+                fetch('/api/graph/data', { headers: { 'X-Operator-Key': OPERATOR_KEY } })
                     .then(res => res.json())
                     .then(data => {
                         const container = document.getElementById('vis-graph');
@@ -1427,7 +1458,7 @@ string RenderFullDashboardHtml(DashboardSnapshot snapshot)
                     });
             }
             function updateCockpitStats() {
-                fetch('/api/cockpit/stats')
+                fetch('/api/cockpit/stats', { headers: { 'X-Operator-Key': OPERATOR_KEY } })
                     .then(res => res.json())
                     .then(data => {
                         const triggeredEl = document.getElementById('metric-triggered');
@@ -1925,6 +1956,17 @@ string EncodeForSingleQuotedJsonAttribute(string value)
 {
     var jsonEscaped = value.Replace("\\", "\\\\").Replace("\"", "\\\"");
     return jsonEscaped.Replace("'", "&#39;");
+}
+
+// Embeds a value inside a double-quoted JS string literal in an inline <script>
+// block. Escapes backslash/double-quote for JS string validity, and breaks up
+// any "</script" sequence so the value can never prematurely close the tag.
+string EncodeForJsStringLiteral(string value)
+{
+    return value
+        .Replace("\\", "\\\\")
+        .Replace("\"", "\\\"")
+        .Replace("</script", "<\\/script", StringComparison.OrdinalIgnoreCase);
 }
 
 record DashboardSnapshot(

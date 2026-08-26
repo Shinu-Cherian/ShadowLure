@@ -86,26 +86,28 @@ A deeper write-up of design decisions, trade-offs, and the production-hardening 
 
 Every hit against these routes returns its decoy response immediately; capture, risk scoring, LLM summarization, and alerting all happen asynchronously afterward — see [ARCHITECTURE.md](ARCHITECTURE.md) for why response latency matters here.
 
-### Operator endpoints
+### Operator endpoints — every one of these requires the operator key
 
-| Method | Route | Auth | Behavior |
-|---|---|---|---|
-| `GET` | `/` | — | Renders the operator dashboard. |
-| `GET` | `/api/canaries/table` | — | Renders the canary registry table as an HTML fragment. |
-| `GET` | `/api/canaries/modal` | — | Renders the "deploy canary" modal. |
-| `GET` | `/api/canaries/{id}/details` | — | Renders the inspection modal with ready-to-run test commands for that token. |
-| `POST` | `/api/canaries` | 🔒 operator key | Provisions a new canary token and links it into the breadcrumb chain. |
-| `DELETE` | `/api/canaries/{id}` | 🔒 operator key | Revokes and deletes a canary token. |
-| `GET` | `/api/graph/data` | — | Returns the Vis.js node/edge graph as JSON. |
-| `GET` | `/api/cockpit/stats` | — | Returns live metrics, risk score, and profile state as JSON. |
-| `GET` | `/api/attacker/details` | — | Renders the forensic attacker dossier modal. |
-| `GET` | `/api/events/stream` | — | Server-Sent Events stream of new trigger events. |
-| `POST` | `/api/simulate/step` | 🔒 operator key | Advances the built-in demo by one simulated trigger. |
-| `POST` | `/api/simulate/full` | 🔒 operator key | Runs the full four-step demo chain. |
-| `POST` | `/api/reset` | 🔒 operator key | Clears all sessions/events/canaries and reseeds the workspace. |
-| `GET` | `/metrics` | — | Prometheus scrape endpoint. |
+The dashboard renders real captured attacker IPs, raw request/response payloads, and decoy credential values — not just the mutating actions — so every route below is gated by the same key, not only the ones that write data.
 
-🔒 = requires the `OPERATOR_API_KEY` configured value, via the `X-Operator-Key` header or a `key` form field. See [Configuration](#configuration).
+| Method | Route | Behavior |
+|---|---|---|
+| `GET` | `/` | Renders the operator dashboard. |
+| `GET` | `/api/canaries/table` | Renders the canary registry table as an HTML fragment. |
+| `GET` | `/api/canaries/modal` | Renders the "deploy canary" modal. |
+| `GET` | `/api/canaries/{id}/details` | Renders the inspection modal with ready-to-run test commands for that token. |
+| `POST` | `/api/canaries` | Provisions a new canary token and links it into the breadcrumb chain. |
+| `DELETE` | `/api/canaries/{id}` | Revokes and deletes a canary token. |
+| `GET` | `/api/graph/data` | Returns the Vis.js node/edge graph as JSON. |
+| `GET` | `/api/cockpit/stats` | Returns live metrics, risk score, and profile state as JSON. |
+| `GET` | `/api/attacker/details` | Renders the forensic attacker dossier modal — real attacker IP, User-Agent, and full raw request/response payloads. |
+| `GET` | `/api/events/stream` | Server-Sent Events stream of new trigger events. |
+| `POST` | `/api/simulate/step` | Advances the built-in demo by one simulated trigger. |
+| `POST` | `/api/simulate/full` | Runs the full four-step demo chain. |
+| `POST` | `/api/reset` | Clears all sessions/events/canaries and reseeds the workspace. |
+| `GET` | `/metrics` | Prometheus scrape endpoint. Point your scrape job's `Authorization`/custom-header config at it, or keep it on an internal-only network path. |
+
+The key is accepted three ways, checked in this order: an `X-Operator-Key` header, a `key` form field, or a `key` query parameter. The rendered dashboard carries it automatically once you've loaded the page with a valid key — its own links, background `fetch` calls, and the SSE connection all propagate it forward — so in practice you only ever type it once, in the URL. See [Configuration](#configuration).
 
 ---
 
@@ -125,7 +127,13 @@ dotnet build ShadowLure.sln
 dotnet run --project src/ShadowLure.Api/ShadowLure.Api.csproj --launch-profile http
 ```
 
-Open `http://localhost:5246`. In `Development`, the app runs with a fixed local-only operator key (a warning is logged) so the dashboard's own buttons keep working out of the box. In `Production`, `OPERATOR_API_KEY` must be set or the app refuses to start.
+On startup, the console logs the exact URL to open, including the key:
+
+```
+[INF] Dashboard: http://localhost:5246/?key=dev-local-operator-key
+```
+
+In `Development` this is a fixed, insecure local-only key (a warning is logged alongside it) — every read and write on the dashboard requires it, not just deploy/revoke/reset. In `Production`, `OPERATOR_API_KEY` must be set to a real secret or the app refuses to start.
 
 ### Run with Docker Compose
 
@@ -142,7 +150,7 @@ This builds the app image, starts a PostgreSQL container, and serves the app at 
 |---|---|---|
 | `ConnectionStrings__DefaultConnection` | No — defaults to local SQLite | Set to a `Host=...` PostgreSQL connection string to switch persistence backends. |
 | `GROQ_API_KEY` | No | Enables LLM-generated decoys and attacker-profile summaries. Falls back to deterministic templates when unset. |
-| `OPERATOR_API_KEY` | **Yes, in Production** | Authenticates the operator-only routes marked 🔒 above. Shadow trap endpoints stay unauthenticated on purpose. Generate one with `openssl rand -hex 32`. |
+| `OPERATOR_API_KEY` | **Yes, in Production** | Authenticates every operator route in the table above — dashboard, forensic dossier, metrics, and the mutating actions. Shadow trap endpoints (`/api/shadow/*`) stay unauthenticated on purpose. Generate one with `openssl rand -hex 32`. |
 
 ---
 
