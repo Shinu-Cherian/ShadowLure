@@ -1,28 +1,24 @@
 # ShadowLure
 
-Active Deception Architecture and Honeytoken Orchestration Engine
+[![CI](https://github.com/Shinu-Cherian/ShadowLure/actions/workflows/ci.yml/badge.svg)](https://github.com/Shinu-Cherian/ShadowLure/actions/workflows/ci.yml)
+[![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
 
-ShadowLure is an enterprise-grade active cyber defense platform designed to detect, track, and profile unauthorized network intruders. Unlike conventional passive honeypots or static canary tokens that issue a single binary alert, ShadowLure deploys dynamic, contextual deception chains across cloud infrastructure, database environments, Kubernetes clusters, and API gateways. When an adversary interacts with a seeded lure, ShadowLure traps the threat actor inside an instrumented decoy path, serving high-fidelity simulated responses while capturing real-time forensic telemetry, tool fingerprints, and behavioral metrics.
-
----
-
-## Technical Overview
-
-Modern security architectures often struggle with high false-positive noise and delayed breach detection. ShadowLure addresses these challenges by shifting the asymmetric advantage back to network defenders through active deception chaining.
-
-Key Operational Properties:
-
-- Zero False Positives: Decoy assets are non-operational traps. Any traffic directed toward a ShadowLure asset indicates high-confidence unauthorized activity.
-- Dynamic Token Provisioning: Operators can provision custom canary tokens for any tech stack (AWS S3, PostgreSQL, Kubernetes, Internal APIs) on demand, receiving dynamic UUIDs and tailored decoy payloads.
-- Multihop Breadcrumb Traps: Decoys do not terminate at a single point. Accessing an initial AWS S3 decoy reveals secondary breadcrumbs leading to PostgreSQL databases, Kubernetes secrets, and internal API tokens.
-- Realistic Synthetic Telemetry: Instead of dropping TCP connections or returning generic HTTP errors, ShadowLure returns believable synthetic S3 bucket listings, database query result sets, and Kubernetes YAML manifests to prolong adversary engagement.
-- Automated Attacker Profiling: Fingerprints incoming HTTP user agents, request cadence, automation script signatures, and network connection metadata to construct a comprehensive threat dossier.
+**Active deception platform for cloud credentials.** ShadowLure turns leaked AWS keys, database connection strings, Kubernetes secrets, and internal API tokens into instrumented decoys. When an attacker uses one, ShadowLure doesn't just log a hit and drop the connection — it serves a believable synthetic response, follows the attacker through a multi-hop chain of linked decoys, fingerprints their tooling, and scores the session's risk in real time.
 
 ---
 
-## System Architecture and Layer Breakdown
+## Why active deception
 
-ShadowLure is architected as a modular, decoupled C# .NET 9 solution separated into clean layer boundaries:
+Static canary tokens fire a single binary alert and stop there. ShadowLure treats a triggered token as the *start* of an engagement, not the end of one:
+
+- **Zero false positives.** Decoy credentials are never used by legitimate systems, so any traffic against one is high-confidence malicious activity by construction.
+- **Multi-hop breadcrumb chains.** An AWS S3 decoy's response embeds a breadcrumb pointing at a database credential; that credential's response points at a Kubernetes secret; that secret points at an internal API token. Each hop the attacker follows deepens the forensic picture and raises the session's risk score.
+- **Believable synthetic responses.** Instead of a generic 403 or a dropped connection, triggered endpoints return realistic S3 bucket listings, CSV exports, Kubernetes secret manifests, and JSON API payloads — engineered to keep an attacker interacting rather than immediately suspecting a trap.
+- **Behavioral profiling, not just IP logging.** Every trigger is fingerprinted by IP + User-Agent, classified against known CLI tool signatures (`aws-cli`, `psql`, `kubectl`, `boto3`, scanners), and checked for automation based on request cadence.
+
+---
+
+## Architecture
 
 ```
                           [ Client / Operator Browser ]
@@ -44,162 +40,153 @@ ShadowLure is architected as a modular, decoupled C# .NET 9 solution separated i
                           v             v             v
                        +---------------------------------+
                        |    ShadowLure.Infrastructure    |
-                       | (EF Core, SQLite, LLM, Alerting)|
+                       | (EF Core, SQLite/Postgres, LLM,  |
+                       |          Alerting)               |
                        +---------------------------------+
 ```
 
-### Component Modules
+| Project | Responsibility |
+|---|---|
+| `ShadowLure.Core` | Zero-dependency domain model: `CanaryToken`, `AttackerSession`, `TriggerEvent`, `CanaryLink`, and the enums/interfaces everything else depends on. |
+| `ShadowLure.Shadow` | `IShadowEngine` — synthesizes the fake S3 listings, CSV exports, and Kubernetes/API JSON responses served to attackers. |
+| `ShadowLure.Profiling` | `IBehavioralProfiler` — SHA-256 client fingerprinting, CLI tool signature detection, automation heuristics, and the risk-scoring formula. |
+| `ShadowLure.Infrastructure` | EF Core persistence (SQLite for local dev, PostgreSQL in production), Prometheus metrics, the Groq LLM client, and Slack/webhook alerting. |
+| `ShadowLure.Api` | Minimal API host: shadow trap routes, the HTMX-rendered operator dashboard, and the SSE telemetry stream. |
 
-1. ShadowLure.Core: Contains domain entities, enums, value objects, database schema definitions (`CanaryToken`, `AttackerSession`, `TriggerEvent`, `CanaryLink`), and interface abstractions.
-2. ShadowLure.Shadow: Implements the active deception engine (`IShadowEngine`), generating dynamic synthetic S3 directory structures, SQL query datasets, and Kubernetes secrets for any registered token ID.
-3. ShadowLure.Profiling: Houses the behavioral analytics pipeline (`IBehavioralProfiler`), generating SHA-256 client fingerprints, detecting CLI automation patterns, calculating chain depths, and scoring threat risk levels.
-4. ShadowLure.Infrastructure: Handles data persistence via Entity Framework Core, Prometheus metric instrumentation (`MetricsService`), LLM threat summary synthesis, and external webhook notification integrations.
-5. ShadowLure.Api: Serves as the Minimal API entry point, HTMX server-side rendering host, Server-Sent Events (SSE) stream server, and interactive operator dashboard host.
-
----
-
-## Core Capabilities
-
-### 1. Dynamic Decoy Provisioning Engine
-Operators are not restricted to pre-configured templates. Through the interactive dashboard or API, operators specify any target environment (e.g., `Enterprise AWS Production`, `Staging Database Cluster`). The engine generates a unique `Guid`, crafts matching decoy credentials, and registers dynamic shadow routing handlers automatically.
-
-### 2. Active Deception Chaining
-Deception assets are interconnected via directional links. Accessing an AWS S3 decoy returns synthetic responses embedded with breadcrumbs pointing to database tokens. Following the database breadcrumbs reveals Kubernetes secrets and API keys, creating a multi-stage decoy chain that tracks attacker progression step by step.
-
-### 3. Live Operator Cockpit and Circular Topology Graph
-The web dashboard features an interactive circular network graph powered by Vis.js Network with custom physics constraints (`barnesHut`). Activated nodes transition in real time from cyan (active) to rose/red (intercepted), while curved edge labels display exact breadcrumb locations with stroke-padded background rendering for clear legibility.
-
-### 4. Server-Sent Events (SSE) Telemetry Stream
-Real-time events bypass traditional polling via a high-throughput SSE endpoint (`/api/events/stream`). Incoming attacker interactions automatically trigger lightweight DOM updates, recalculating Risk Scores, updating Threat Level indicators, and re-rendering Attacker Profile cards without requiring page refreshes.
-
-### 5. Forensic Attacker Intelligence Dossier
-Operators can launch the Forensic Attacker Dossier modal to inspect full session analytics:
-- Real Connection IP & Network Connection Metadata
-- User-Agent Client Fingerprint & CLI Security Tool Classifier
-- Automation Detection Status (Interactive Shell vs. Automated Recon Script)
-- Risk Score Calculation (0-100 scale: Low, Medium, High, Critical)
-- Dynamic Threat Intelligence Behavioral Summary
-- Execution Chronology Trace Table containing full un-truncated HTTP request payloads and deception response payloads.
+A deeper write-up of design decisions, trade-offs, and the production-hardening pass this codebase went through is in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---
 
-## Technology Stack
+## Technology stack
 
-- Backend Framework: C# .NET 9 Minimal APIs
-- Object-Relational Mapper: Entity Framework Core 9.0
-- Data Persistence: SQLite / EF Core Relational Engine
-- Frontend Logic & Interactivity: HTMX 2.0 (Server-Side HTML Fragments & SSE Swap)
-- Styling & Design System: Vanilla CSS & Tailwind CSS Engine
-- Graph Visualization: Vis.js Network Engine (Radial Elliptical Layouts & Barnes-Hut Physics)
-- Smooth Scrolling & Reveal Animations: Lenis 1.1 Smooth Scroll & GSAP 3.12 ScrollTrigger
-- Observability & Metrics: Prometheus Client Library (`prometheus-net`)
-- Application Server: Kestrel Web Server
+| Layer | Choice |
+|---|---|
+| Backend | C# / .NET 9 Minimal APIs, Kestrel |
+| Persistence | EF Core 9 — SQLite locally, PostgreSQL in production (auto-selected from the connection string) |
+| Frontend | HTMX 1.9 (server-rendered fragments + SSE swaps), Tailwind CSS via the Play CDN, Vis.js Network for the topology graph |
+| Observability | Prometheus (`prometheus-net`), Serilog structured logging |
+| LLM | Groq (`llama-3.3-70b-versatile`) for decoy generation and attacker-profile summaries, with deterministic fallback templates when no API key is configured |
+| Infrastructure | Docker, Terraform (AWS ECS Fargate + ALB + ECR) |
+| Testing | xUnit |
+
+> The Tailwind CDN script is the in-browser **Play CDN**, not a compiled production build — a known, deliberate trade-off to keep the dashboard a single self-contained file with no frontend build step. Fine for this project's scope; would be swapped for a compiled Tailwind pipeline in a larger app.
 
 ---
 
-## API Reference Specification
+## API reference
 
-### Dynamic Shadow Endpoints (Attacker Trap Targets)
+### Shadow trap endpoints (unauthenticated by design — this is the surface attackers are meant to reach)
 
-Shadow routes handle incoming requests dynamically for any provisioned canary token `Guid`:
-
-| HTTP Method | Route | Description |
+| Method | Route | Behavior |
 |---|---|---|
-| POST | `/api/shadow/aws/{tokenId:guid}` | Traps AWS CLI/S3 requests for token `tokenId`, returning synthetic S3 file listings. |
-| POST | `/api/shadow/db/{tokenId:guid}` | Traps SQL database requests for token `tokenId`, returning synthetic CSV/SQL data. |
-| POST | `/api/shadow/k8s/{tokenId:guid}` | Traps Kubernetes cluster secret requests for token `tokenId`, returning fake secret YAMLs. |
-| POST | `/api/shadow/api/{tokenId:guid}` | Traps API token invocations for token `tokenId`, returning fake internal JSON data. |
+| `POST` | `/api/shadow/aws/{tokenId:guid}` | Returns a synthetic S3 bucket listing for the given token. |
+| `POST` | `/api/shadow/db/{tokenId:guid}` | Returns a synthetic CSV export; flagged as a data-exfiltration attempt. |
+| `POST` | `/api/shadow/k8s/{tokenId:guid}` | Returns a fake Kubernetes secret manifest. |
+| `POST` | `/api/shadow/api/{tokenId:guid}` | Returns a fake internal API JSON payload. |
 
-### Operator Dashboard Endpoints
+Every hit against these routes returns its decoy response immediately; capture, risk scoring, LLM summarization, and alerting all happen asynchronously afterward — see [ARCHITECTURE.md](ARCHITECTURE.md) for why response latency matters here.
 
-| HTTP Method | Route | Description |
-|---|---|---|
-| GET | `/` | Renders the Widescreen Operator Cockpit. |
-| GET | `/api/events/stream` | Opens an SSE connection streaming live telemetry event cards. |
-| GET | `/api/cockpit/stats` | Returns real-time JSON metrics, risk scores, and profile state. |
-| GET | `/api/graph/data` | Returns Vis.js network nodes and edge links JSON structure. |
-| GET | `/api/canaries/modal` | Renders the HTML modal for deploying custom contextual canary tokens. |
-| POST | `/api/canaries` | Creates a new custom decoy token dynamically and registers its shadow routes. |
-| GET | `/api/canaries/{id}/details` | Renders the inspection modal containing exact PowerShell test commands for token `{id}`. |
-| DELETE | `/api/canaries/{id}` | Revokes and deletes a specific canary token from the database. |
-| GET | `/api/attacker/details` | Renders the Forensic Attacker Dossier Modal with full HTTP logs. |
-| POST | `/api/simulate/step` | Advances the simulation scenario by one decoy interception step. |
-| POST | `/api/reset` | Resets all trigger events and restores the seed workspace state. |
-| GET | `/metrics` | Exposes Prometheus metrics format for scraping. |
+### Operator endpoints
 
----
+| Method | Route | Auth | Behavior |
+|---|---|---|---|
+| `GET` | `/` | — | Renders the operator dashboard. |
+| `GET` | `/api/canaries/table` | — | Renders the canary registry table as an HTML fragment. |
+| `GET` | `/api/canaries/modal` | — | Renders the "deploy canary" modal. |
+| `GET` | `/api/canaries/{id}/details` | — | Renders the inspection modal with ready-to-run test commands for that token. |
+| `POST` | `/api/canaries` | 🔒 operator key | Provisions a new canary token and links it into the breadcrumb chain. |
+| `DELETE` | `/api/canaries/{id}` | 🔒 operator key | Revokes and deletes a canary token. |
+| `GET` | `/api/graph/data` | — | Returns the Vis.js node/edge graph as JSON. |
+| `GET` | `/api/cockpit/stats` | — | Returns live metrics, risk score, and profile state as JSON. |
+| `GET` | `/api/attacker/details` | — | Renders the forensic attacker dossier modal. |
+| `GET` | `/api/events/stream` | — | Server-Sent Events stream of new trigger events. |
+| `POST` | `/api/simulate/step` | 🔒 operator key | Advances the built-in demo by one simulated trigger. |
+| `POST` | `/api/simulate/full` | 🔒 operator key | Runs the full four-step demo chain. |
+| `POST` | `/api/reset` | 🔒 operator key | Clears all sessions/events/canaries and reseeds the workspace. |
+| `GET` | `/metrics` | — | Prometheus scrape endpoint. |
 
-## Dynamic Decoy Testing Guide
-
-To test any deployed decoy token (seeded or custom-created):
-
-### 1. Provision or Select a Canary Token
-Click **Deploy Canary** on the dashboard to create a custom token, or select any existing token from the **Canary Registry** table.
-
-### 2. Inspect Dynamic Command
-Click **Inspect** on the target token's row in the table. The inspection modal automatically generates the tailored PowerShell command with that token's unique `Guid`.
-
-### 3. General Command Pattern
-```powershell
-curl.exe -X POST http://localhost:5246/api/shadow/{serviceType}/{your-token-guid} -H "User-Agent: {tool-signature}" -d "{payload}"
-```
-
-### 4. Service Type Map
-- AWS S3 Decoy: Service type path = `aws`
-- PostgreSQL Database Decoy: Service type path = `db`
-- Kubernetes Secret Decoy: Service type path = `k8s`
-- Internal API Decoy: Service type path = `api`
+🔒 = requires the `OPERATOR_API_KEY` configured value, via the `X-Operator-Key` header or a `key` form field. See [Configuration](#configuration).
 
 ---
 
-## Local Setup and Installation
+## Getting started
 
 ### Prerequisites
 
-- .NET 9.0 SDK
+- [.NET 9 SDK](https://dotnet.microsoft.com/download)
 - Git
-- PowerShell / Command Prompt
 
-### Build and Run Instructions
+### Run locally
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Shinu-Cherian/ShadowLure.git
-   cd ShadowLure
-   ```
+```bash
+git clone https://github.com/Shinu-Cherian/ShadowLure.git
+cd ShadowLure
+dotnet build ShadowLure.sln
+dotnet run --project src/ShadowLure.Api/ShadowLure.Api.csproj --launch-profile http
+```
 
-2. Restore dependencies and build the solution:
-   ```bash
-   dotnet build ShadowLure.sln
-   ```
+Open `http://localhost:5246`. In `Development`, the app runs with a fixed local-only operator key (a warning is logged) so the dashboard's own buttons keep working out of the box. In `Production`, `OPERATOR_API_KEY` must be set or the app refuses to start.
 
-3. Launch the application server:
-   ```bash
-   dotnet run --project src/ShadowLure.Api/ShadowLure.Api.csproj --launch-profile http
-   ```
+### Run with Docker Compose
 
-   In `Development` this runs with a fixed local-only operator key and prints a
-   warning; canary management (deploy/revoke/reset/simulate) still works out of
-   the box from the dashboard. In `Production`, set `OPERATOR_API_KEY` (see
-   below) or the app refuses to start.
+```bash
+cp .env.example .env   # fill in POSTGRES_PASSWORD and OPERATOR_API_KEY
+docker compose up --build
+```
 
-4. Access the web dashboard:
-   Open `http://localhost:5246` in your browser.
+This builds the app image, starts a PostgreSQL container, and serves the app at `http://localhost:5000`. Compose fails fast if `POSTGRES_PASSWORD` or `OPERATOR_API_KEY` are missing from `.env` rather than falling back to a committed default.
 
----
-
-## Configuration
+### Configuration
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ConnectionStrings__DefaultConnection` | No (defaults to local SQLite) | Set to a `Host=...` PostgreSQL connection string to switch persistence backends. |
-| `GROQ_API_KEY` | No | Enables LLM-generated decoys and attacker profile summaries. Falls back to deterministic built-in templates when unset. |
-| `OPERATOR_API_KEY` | **Yes, in Production** | Authenticates operator-only actions: `POST /api/canaries`, `DELETE /api/canaries/{id}`, `POST /api/reset`, `POST /api/simulate/*`. Shadow trap endpoints (`/api/shadow/*`) stay unauthenticated by design — that's the surface attackers are meant to hit. Generate one with `openssl rand -hex 32`. The rendered dashboard injects the configured key into its own HTMX/form requests automatically, so the UI keeps working once it's set; only direct, credential-less API calls are rejected. |
+| `ConnectionStrings__DefaultConnection` | No — defaults to local SQLite | Set to a `Host=...` PostgreSQL connection string to switch persistence backends. |
+| `GROQ_API_KEY` | No | Enables LLM-generated decoys and attacker-profile summaries. Falls back to deterministic templates when unset. |
+| `OPERATOR_API_KEY` | **Yes, in Production** | Authenticates the operator-only routes marked 🔒 above. Shadow trap endpoints stay unauthenticated on purpose. Generate one with `openssl rand -hex 32`. |
 
-For `docker compose`, copy [`.env.example`](.env.example) to `.env` and fill in real values before running `docker compose up` — the compose file fails fast if `POSTGRES_PASSWORD` or `OPERATOR_API_KEY` are missing rather than falling back to a committed default.
+---
+
+## Testing
+
+```bash
+dotnet test ShadowLure.sln
+```
+
+xUnit test suite covering `ShadowEngine`'s synthetic response generation and `BehavioralProfiler`'s fingerprinting, tool-signature detection, and risk-scoring formula (including the 0–100 cap and level thresholds documented in [ARCHITECTURE.md](ARCHITECTURE.md)). CI runs the full build, test, and a Docker build verification on every push — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+---
+
+## Deploying to AWS
+
+Terraform in [`terraform/`](terraform/) provisions a VPC, ALB, ECS Fargate service, ECR repository, and CloudWatch logging. The task definition pulls its configuration from AWS Secrets Manager rather than plaintext environment variables, so three secrets must exist first:
+
+```bash
+cd terraform
+terraform init
+terraform plan \
+  -var="db_connection_string_secret_arn=<arn>" \
+  -var="groq_api_key_secret_arn=<arn>" \
+  -var="operator_api_key_secret_arn=<arn>"
+terraform apply
+```
+
+---
+
+## Project structure
+
+```
+src/
+  ShadowLure.Core/            domain models
+  ShadowLure.Shadow/          decoy response generation
+  ShadowLure.Profiling/       fingerprinting + risk scoring
+  ShadowLure.Infrastructure/  EF Core, metrics, LLM client, alerting
+  ShadowLure.Api/             Minimal API host + dashboard
+tests/ShadowLure.Tests/       xUnit test suite
+terraform/                    AWS ECS Fargate infrastructure
+```
 
 ---
 
 ## Author
 
-Developed by Shinu Cherian as an active cyber defense research project.
+Shinu Cherian — [LinkedIn](https://www.linkedin.com/in/shinucherian90/)
